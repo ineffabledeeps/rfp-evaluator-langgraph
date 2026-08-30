@@ -56,12 +56,16 @@ tab_criteria, tab_new_eval, tab_leaderboard = st.tabs(
 # TAB 1 — CRITERIA
 # ==================================================================
 with tab_criteria:
-    st.subheader("Active Evaluation Criteria")
+    st.subheader("Evaluation Criteria Management")
+    
     rows = db.get_all_criteria_rows()
     df = pd.DataFrame(
         rows, columns=["ID", "Name", "Description", "Weight (%)", "Max Score", "Active"]
     )
     df["Active"] = df["Active"].map({1: "Yes", 0: "No"})
+    
+    # Display current criteria
+    st.markdown("### Current Criteria")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     active_weight_sum = df.loc[df["Active"] == "Yes", "Weight (%)"].sum()
@@ -72,6 +76,61 @@ with tab_criteria:
         )
     else:
         st.caption(f"Active weights sum to {active_weight_sum:.1f}% ✅")
+
+    st.divider()
+
+    # Add New Criterion
+    st.markdown("### ➕ Add New Criterion")
+    col1, col2 = st.columns(2)
+    with col1:
+        new_name = st.text_input("Criterion Name", key="new_crit_name")
+    with col2:
+        new_weight = st.number_input("Weight (%)", min_value=0.0, max_value=100.0, value=10.0, step=1.0, key="new_crit_weight")
+    
+    new_description = st.text_area("Description", height=60, key="new_crit_desc")
+    new_max_score = st.number_input("Max Score", min_value=1, value=10, key="new_crit_max")
+    
+    if st.button("Add Criterion", type="primary", key="add_crit_btn"):
+        if new_name.strip():
+            db.add_criterion(new_name.strip(), new_description.strip(), new_weight, new_max_score)
+            st.success(f"✅ Added criterion: {new_name}")
+            st.rerun()
+        else:
+            st.error("Criterion name cannot be empty")
+
+    st.divider()
+
+    # Edit Existing Criteria
+    if rows:
+        st.markdown("### ✏️ Edit Existing Criteria")
+        for row in rows:
+            crit_id, name, desc, weight, max_score, is_active = row
+            status_text = "Active" if is_active else "Inactive"
+            
+            with st.expander(f"{name} ({status_text})"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    edit_name = st.text_input("Name", value=name, key=f"edit_name_{crit_id}")
+                    edit_weight = st.number_input("Weight (%)", min_value=0.0, max_value=100.0, value=weight, step=1.0, key=f"edit_weight_{crit_id}")
+                with col2:
+                    edit_desc = st.text_area("Description", value=desc or "", height=80, key=f"edit_desc_{crit_id}")
+                    edit_max_score = st.number_input("Max Score", min_value=1, value=max_score, key=f"edit_max_{crit_id}")
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    edit_active = st.checkbox("Active", value=bool(is_active), key=f"edit_active_{crit_id}")
+                
+                with col2:
+                    if st.button("💾 Save Changes", key=f"save_crit_{crit_id}"):
+                        db.update_criterion(crit_id, edit_name.strip(), edit_desc.strip(), edit_weight, edit_max_score, int(edit_active))
+                        st.success(f"✅ Updated {edit_name}")
+                        st.rerun()
+                
+                with col3:
+                    if st.button("🗑️ Delete", key=f"del_crit_{crit_id}"):
+                        db.delete_criterion(crit_id)
+                        st.success(f"✅ Deleted criterion")
+                        st.rerun()
 
 # ==================================================================
 # TAB 2 — NEW EVALUATION (upload + run a batch)

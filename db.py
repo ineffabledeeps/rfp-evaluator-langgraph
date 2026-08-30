@@ -163,3 +163,40 @@ def get_supplier_results(run_id: int) -> list:
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
+def add_criterion(name: str, description: str, weight: float, max_score: int, is_active: int = 1) -> int:
+    """Adds a new evaluation criterion and returns the criterion_id."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO evaluation_criteria (name, description, weight, max_score, is_active) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (name, description, weight, max_score, is_active),
+    )
+    conn.commit()
+    criterion_id = cursor.lastrowid
+    conn.close()
+    return criterion_id
+
+
+def update_criterion(criterion_id: int, name: str, description: str, weight: float, max_score: int, is_active: int) -> None:
+    """Updates an existing evaluation criterion."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE evaluation_criteria SET name = ?, description = ?, weight = ?, max_score = ?, is_active = ? "
+        "WHERE criterion_id = ?",
+        (name, description, weight, max_score, is_active, criterion_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_criterion(criterion_id: int) -> None:
+    """Deletes an evaluation criterion by ID."""
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM evaluation_criteria WHERE criterion_id = ?", (criterion_id,))
+    conn.commit()
+    conn.close()
