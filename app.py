@@ -136,28 +136,54 @@ with tab_new_eval:
                 st.info(f"Created batch RFP_RUN_ID = {new_run_id}")
 
                 progress_bar = st.progress(0.0)
-                status_box = st.empty()
+                LEVEL_ICON = {"error": "🔴", "warning": "🟡", "success": "🟢", "info": "🔵"}
+                status_containers = {}
 
-                def on_progress(done, total, supplier_name, status):
-                    progress_bar.progress(done / total)
-                    icon = "✅" if status == "evaluated" else "❌"
-                    status_box.write(f"{icon} {supplier_name}: **{status}** ({done}/{total})")
+                def on_supplier_start(index, total, supplier_name):
+                    container = st.status(f"[{index}/{total}] {supplier_name}", expanded=True)
+                    log_placeholder = container.empty()
+                    status_containers[supplier_name] = {
+                        "status": container, "log": log_placeholder, "lines": [],
+                    }
+
+                def on_node_event(supplier_name, node_name, update):
+                    entry = status_containers.get(supplier_name)
+                    if not entry:
+                        return
+                    for t in update.get("trace", []):
+                        icon = LEVEL_ICON.get(t["level"], "🔵")
+                        entry["lines"].append(f"{icon} `{t['ts']}` **{t['node']}** — {t['message']}")
+                    entry["log"].markdown("\n\n".join(entry["lines"]))
+
+                def on_supplier_done(index, total, supplier_name, status):
+                    entry = status_containers.get(supplier_name)
+                    if entry:
+                        final_state = "complete" if status == "evaluated" else "error"
+                        entry["status"].update(
+                            label=f"[{index}/{total}] {supplier_name} — {status}",
+                            state=final_state,
+                            expanded=(status != "evaluated"),
+                        )
+                    progress_bar.progress(index / total)
 
                 try:
                     pipeline.run_batch(
                         rfp_run_id=new_run_id,
                         uploaded_files=uploaded_files_payload,
                         active_criteria=active_criteria,
-                        on_progress=on_progress,
+                        on_supplier_start=on_supplier_start,
+                        on_node_event=on_node_event,
+                        on_progress=on_supplier_done,
                     )
                     st.session_state.last_run_id = new_run_id
                     st.success(
                         f"Batch {new_run_id} completed. Open the **Leaderboard & Results** "
-                        "tab to view the ranking."
+                        "tab to view the ranking. Expand any supplier above (or the Detailed "
+                        "Scorecard in that tab) to see exactly what each step did."
                     )
                 except Exception as e:
                     pipeline.update_rfp_run_status(new_run_id, "failed", error_message=str(e))
-                    st.error(f"Batch failed: {e}")
+                    st.error(f"Batch-level failure (before any supplier could be isolated): {e}")
     else:
         st.caption("Upload at least one supplier PDF to begin.")
 
@@ -266,6 +292,18 @@ with tab_leaderboard:
                 st.markdown(f"**Overall summary:** {raw['overall_summary']}")
             if raw.get("risks"):
                 st.markdown("**Risks flagged:** " + "; ".join(raw["risks"]))
+
+            trace = details.get("trace", [])
+            if trace:
+                LEVEL_ICON = {"error": "🔴", "warning": "🟡", "success": "🟢", "info": "🔵"}
+                with st.expander(f"🛠️ Execution trace ({len(trace)} steps) — debug log", expanded=(s_status == "failed")):
+                    for t in trace:
+                        icon = LEVEL_ICON.get(t.get("level"), "🔵")
+                        st.markdown(f"{icon} `{t.get('ts')}` **{t.get('node')}** — {t.get('message')}")
+
+            if details.get("exception_traceback"):
+                with st.expander("⚠️ Unhandled exception traceback", expanded=True):
+                    st.code(details["exception_traceback"], language="text")
 
         st.markdown("### 📎 Run Details & Tie-break Rule")
         st.caption(

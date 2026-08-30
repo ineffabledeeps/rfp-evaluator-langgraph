@@ -6,13 +6,22 @@ retry-on-invalid-JSON via a LangGraph loop), deterministic validation,
 weighted scoring, peer benchmarking, PPI + tie-break ranking, and SQLite
 persistence.
 
+Every node emits a structured trace entry (node, level, message, timestamp)
+that is (a) streamed out live via callbacks for the Streamlit UI, and
+(b) persisted into result_json so a run can be debugged after the fact,
+not only while it's running. Exceptions inside a node never crash the
+whole batch -- they're caught, logged into the trace, and that supplier
+is marked 'failed' while the rest of the batch continues.
+
 This module has no Streamlit dependency by design -- it can be tested,
-demoed, or reused headlessly. The Streamlit UI (app.py) only calls
-run_batch() and reads back from the database.
+demoed, or reused headlessly.
 """
 
 import json
-from typing import Optional, Callable
+import operator
+import traceback
+from datetime import datetime
+from typing import Optional, Callable, Annotated
 
 import pypdf
 from typing_extensions import TypedDict
@@ -45,6 +54,36 @@ def is_llm_configured() -> bool:
 
 
 # ==========================================
+# TRACE HELPER
+# ==========================================
+def _trace(node: str, message: str, level: str = "info") -> list:
+    """Builds a single structured trace entry, wrapped in a list so it can be
+    added directly to a node's returned state update (the 'trace' state field
+    uses an additive reducer, so returning [entry] appends rather than overwrites).
+    level: 'info' | 'success' | 'warning' | 'error'."""
+    return [{
+        "node": node,
+        "level": level,
+        "message": message,
+        "ts": datetime.now().strftime("%H:%M:%S"),
+    }]
+
+
+def _merge_state(state: dict, update: dict) -> dict:
+    """Applies one node's partial update to the running state, mirroring the
+    graph's own reducers: 'trace' entries are appended, everything else is
+    overwritten. Used when driving the graph via .stream() so we can react to
+    each node as it completes without running the graph a second time."""
+    merged = dict(state)
+    for k, v in update.items():
+        if k == "trace":
+            merged["trace"] = merged.get("trace", []) + v
+        else:
+            merged[k] = v
+    return merged
+
+
+# ==========================================
 # GRAPH STATE
 # ==========================================
 class SupplierState(TypedDict):
@@ -68,6 +107,8 @@ class SupplierState(TypedDict):
     absolute_score: float
     status: str  # 'evaluated' | 'failed'
 
+    trace: Annotated[list, operator.add]  # additive: every node appends, nothing overwrites it
+
 
 # ==========================================
 # 1. DOCUMENT TEXT EXTRACTION
@@ -76,15 +117,22 @@ def extract_pdf_text(file_path: str) -> dict:
     """Extracts raw text content from a supplier PDF using pypdf."""
     try:
         text = ""
+        page_count = 0
         with open(file_path, "rb") as f:
             reader = pypdf.PdfReader(f)
+            page_count = len(reader.pages)
             for page in reader.pages:
                 page_text = page.extract_text()
                 if page_text:
                     text += page_text + "\n"
-        return {"text": text.strip(), "success": len(text.strip()) > 0}
+        success = len(text.strip()) > 0
+        if success:
+            return {"text": text.strip(), "success": True, "page_count": page_count, "error": None}
+        return {"text": "", "success": False, "page_count": page_count,
+                "error": "No extractable text found (PDF may be a scanned image with no OCR layer)."}
     except Exception as e:
-        return {"text": f"Extraction Error: {str(e)}", "success": False}
+        return {"text": "", "success": False, "page_count": 0,
+                "error": f"{type(e).__name__}: {e}"}
 
 
 # ==========================================
@@ -93,9 +141,12 @@ def extract_pdf_text(file_path: str) -> dict:
 def call_llm_scorer(extracted_text: str, active_criteria: dict, llm_attempt: int,
                      validation_warnings: list) -> dict:
     """Calls the LLM to score one supplier. Feeds prior validation warnings back into
-    the prompt on retry so the model can self-correct instead of blindly re-rolling."""
+    the prompt on retry so the model can self-correct instead of blindly re-rolling.
+    Always returns a structured result -- never raises -- so the caller always knows
+    exactly what happened (success, JSON-parse failure, or a network/API exception)."""
     if _llm is None:
-        raise RuntimeError("LLM is not configured. Call configure_llm() first.")
+        return {"success": False, "data": {}, "error": "LLM is not configured (missing API key).",
+                "raw_text": ""}
 
     feedback = ""
     if llm_attempt > 1 and validation_warnings:
@@ -130,6 +181,7 @@ active criterion listed above. Stay within the given score range. Output JSON on
 no markdown fences, no conversational text.
 """
 
+    raw_text = ""
     try:
         response = _llm.invoke([
             SystemMessage(content="You are an expert procurement grading engine. "
@@ -137,9 +189,15 @@ no markdown fences, no conversational text.
             HumanMessage(content=prompt),
         ])
         raw_text = response.content.strip().removeprefix("```json").removesuffix("```").strip()
-        return json.loads(raw_text)
-    except Exception:
-        return {}  # downstream validation treats an empty dict as invalid and triggers a retry
+        parsed = json.loads(raw_text)
+        return {"success": True, "data": parsed, "error": None, "raw_text": raw_text}
+    except json.JSONDecodeError as e:
+        return {"success": False, "data": {}, "error": f"JSON parse error: {e}",
+                "raw_text": raw_text[:500]}
+    except Exception as e:
+        # Covers network errors, auth errors, rate limits, provider-side errors, etc.
+        return {"success": False, "data": {}, "error": f"LLM call failed: {type(e).__name__}: {e}",
+                "raw_text": ""}
 
 
 # ==========================================
@@ -154,7 +212,7 @@ def validate_scorecard(raw_llm_output: dict, active_criteria: dict) -> dict:
     if not raw_llm_output or "criteria" not in raw_llm_output:
         return {
             "valid_criteria": {},
-            "validation_warnings": ["Malformed or empty JSON payload response."],
+            "validation_warnings": ["Malformed or empty JSON payload from LLM response."],
             "is_valid": False,
         }
 
@@ -178,7 +236,12 @@ def validate_scorecard(raw_llm_output: dict, active_criteria: dict) -> dict:
             }
         else:
             item = llm_map[c_id]
-            raw_score = float(item.get("score", 0.0))
+            try:
+                raw_score = float(item.get("score", 0.0))
+            except (TypeError, ValueError):
+                warnings.append(f"Non-numeric score for {name}: {item.get('score')!r}. Defaulted to 0.")
+                raw_score = 0.0
+                is_valid = False
 
             if raw_score < 0 or raw_score > max_allowed:
                 warnings.append(
@@ -282,37 +345,62 @@ def calculate_ppi_and_rank(evaluated_results: list, benchmarks: dict) -> list:
 
 
 # ==========================================
-# GRAPH NODES
+# GRAPH NODES (each one always emits a trace entry, success or failure)
 # ==========================================
 def _node_extract_pdf(state: SupplierState):
     result = extract_pdf_text(state["file_path"])
-    return {"extracted_text": result["text"], "extraction_success": result["success"]}
+    if result["success"]:
+        msg = f"Extracted {len(result['text'])} characters from {result['page_count']} page(s)."
+        return {"extracted_text": result["text"], "extraction_success": True,
+                "trace": _trace("extract", msg, level="success")}
+    msg = result["error"] or "Unknown extraction failure."
+    return {"extracted_text": "", "extraction_success": False,
+            "trace": _trace("extract", msg, level="error")}
 
 
 def _node_evaluate_with_llm(state: SupplierState):
+    attempt = state.get("llm_attempt", 0) + 1
     result = call_llm_scorer(
-        state["extracted_text"], state["active_criteria"],
-        state["llm_attempt"], state["validation_warnings"],
+        state["extracted_text"], state["active_criteria"], attempt, state.get("validation_warnings", []),
     )
-    return {"raw_llm_output": result, "llm_attempt": state.get("llm_attempt", 0) + 1}
+    if result["success"]:
+        msg = f"Attempt {attempt}: LLM returned parseable JSON ({len(result['data'].get('criteria', []))} criteria scored)."
+        return {"raw_llm_output": result["data"], "llm_attempt": attempt,
+                "trace": _trace("evaluate", msg, level="success")}
+    msg = f"Attempt {attempt}: {result['error']}"
+    return {"raw_llm_output": {}, "llm_attempt": attempt,
+            "trace": _trace("evaluate", msg, level="error")}
 
 
 def _node_validate(state: SupplierState):
     result = validate_scorecard(state["raw_llm_output"], state["active_criteria"])
-    return {
-        "valid_criteria": result["valid_criteria"],
-        "validation_warnings": result["validation_warnings"],
-        "is_valid": result["is_valid"],
-    }
+    if result["is_valid"]:
+        msg = "All active criteria present and within range."
+        level = "success"
+    elif result["valid_criteria"]:
+        msg = "Validation issues (will retry): " + "; ".join(result["validation_warnings"])
+        level = "warning"
+    else:
+        msg = "Validation issues: " + "; ".join(result["validation_warnings"])
+        level = "warning"
+    return {"valid_criteria": result["valid_criteria"], "validation_warnings": result["validation_warnings"],
+            "is_valid": result["is_valid"], "trace": _trace("validate", msg, level=level)}
 
 
 def _node_score(state: SupplierState):
     abs_score = calculate_absolute_score(state["valid_criteria"], state["active_criteria"])
-    return {"absolute_score": abs_score, "status": "evaluated"}
+    msg = f"Absolute weighted score calculated: {abs_score}"
+    return {"absolute_score": abs_score, "status": "evaluated",
+            "trace": _trace("score", msg, level="success")}
 
 
 def _node_mark_failed(state: SupplierState):
-    return {"status": "failed"}
+    if not state.get("extraction_success", True):
+        reason = "PDF text extraction failed -- see 'extract' node above."
+    else:
+        reason = (f"Validation still failing after {state.get('llm_attempt', 0)} LLM attempt(s) "
+                  "-- see 'evaluate'/'validate' entries above.")
+    return {"status": "failed", "trace": _trace("fail", reason, level="error")}
 
 
 def build_supplier_graph():
@@ -350,14 +438,23 @@ def build_supplier_graph():
 # PERSISTENCE
 # ==========================================
 def persist_supplier_result(rfp_run_id: int, result: dict) -> None:
-    """Saves a supplier's initial evaluation pass (pre-ranking) to SQLite."""
+    """Saves a supplier's initial evaluation pass (pre-ranking) to SQLite, including
+    the full trace log and any unhandled-exception traceback, so the run stays
+    debuggable after the fact."""
     conn = get_conn()
     cursor = conn.cursor()
 
     details = {
         "valid_criteria": result.get("valid_criteria", {}),
         "raw_llm_output": result.get("raw_llm_output", {}),
+        "trace": result.get("trace", []),
     }
+    if result.get("_exception_traceback"):
+        details["exception_traceback"] = result["_exception_traceback"]
+
+    warnings_list = list(result.get("validation_warnings", []) or [])
+    if result.get("_exception_traceback"):
+        warnings_list.append("An unhandled exception occurred -- see trace / traceback for details.")
 
     cursor.execute('''
         INSERT INTO supplier_results (
@@ -371,7 +468,7 @@ def persist_supplier_result(rfp_run_id: int, result: dict) -> None:
         result.get("experience_rating"),
         result.get("file_path", "").split("/")[-1].split("\\")[-1],
         result.get("status", "failed"),
-        "; ".join(result.get("validation_warnings", [])) if result.get("validation_warnings") else None,
+        "; ".join(warnings_list) if warnings_list else None,
         result.get("absolute_score"),
         json.dumps(details),
     ))
@@ -382,7 +479,8 @@ def persist_supplier_result(rfp_run_id: int, result: dict) -> None:
 def persist_final_ranks(rfp_run_id: int, ranked_suppliers: list) -> None:
     """Updates PPI, final rank, and the ENRICHED result_json (benchmark/gap/relative_pct
     per criterion) so every score on the leaderboard stays traceable to its criterion,
-    weight, evidence, and the business rule that produced it."""
+    weight, evidence, and the business rule that produced it. The trace log already
+    persisted by persist_supplier_result is preserved untouched."""
     conn = get_conn()
     cursor = conn.cursor()
 
@@ -395,6 +493,7 @@ def persist_final_ranks(rfp_run_id: int, ranked_suppliers: list) -> None:
         details = json.loads(existing[0]) if existing and existing[0] else {}
         details["valid_criteria"] = row["valid_criteria"]  # now enriched with benchmark/gap/relative_pct
         details["raw_llm_output"] = row.get("raw_llm_output", details.get("raw_llm_output", {}))
+        # 'trace' key is left untouched here -- it already carries the full node history.
 
         cursor.execute('''
             UPDATE supplier_results
@@ -436,34 +535,83 @@ def create_rfp_run(active_criteria: dict, supplier_count: int) -> int:
 # ==========================================
 # BATCH ORCHESTRATOR
 # ==========================================
-def run_batch(rfp_run_id: int, uploaded_files: list, active_criteria: dict,
-              on_progress: Optional[Callable[[int, int, str, str], None]] = None) -> list:
+def run_batch(
+    rfp_run_id: int,
+    uploaded_files: list,
+    active_criteria: dict,
+    on_supplier_start: Optional[Callable[[int, int, str], None]] = None,
+    on_node_event: Optional[Callable[[str, str, dict], None]] = None,
+    on_progress: Optional[Callable[[int, int, str, str], None]] = None,
+) -> list:
     """Runs every supplier through the per-supplier graph, persists interim results,
     then benchmarks + ranks the whole batch together (deterministic, plain Python)
-    before persisting final ranks and closing out the run."""
+    before persisting final ranks and closing out the run.
+
+    Callbacks (all optional, all safe to omit for headless/test use):
+      on_supplier_start(index, total, supplier_name) -- fired before a supplier begins
+      on_node_event(supplier_name, node_name, update_dict) -- fired after EVERY graph
+          node completes, including retries; update_dict includes that node's 'trace'
+          entries, giving live, granular visibility into exactly what's happening.
+      on_progress(index, total, supplier_name, final_status) -- fired once a supplier
+          finishes (evaluated or failed).
+
+    A supplier that raises an unexpected exception never crashes the batch: the
+    exception is caught, logged into that supplier's trace + traceback, the supplier
+    is marked 'failed', and the loop continues to the next supplier.
+    """
     graph = build_supplier_graph()
     all_results = []
     total = len(uploaded_files)
+    any_evaluated = False
 
     for i, file_info in enumerate(uploaded_files):
-        initial_state = {
+        supplier_name = file_info.get("supplier_name") or f"Supplier {i + 1}"
+
+        if on_supplier_start:
+            on_supplier_start(i + 1, total, supplier_name)
+
+        state = {
             **file_info,
             "rfp_run_id": rfp_run_id,
             "active_criteria": active_criteria,
             "llm_attempt": 0,
             "validation_warnings": [],
+            "trace": [],
         }
-        result = graph.invoke(initial_state)
-        all_results.append(result)
-        persist_supplier_result(rfp_run_id, result)
+
+        try:
+            for step in graph.stream(state, stream_mode="updates"):
+                for node_name, update in step.items():
+                    state = _merge_state(state, update)
+                    if on_node_event:
+                        on_node_event(supplier_name, node_name, update)
+        except Exception as e:
+            tb = traceback.format_exc()
+            error_trace = _trace("orchestrator", f"Unhandled exception: {type(e).__name__}: {e}", level="error")
+            state["status"] = "failed"
+            state["trace"] = state.get("trace", []) + error_trace
+            state["_exception_traceback"] = tb
+            if on_node_event:
+                on_node_event(supplier_name, "orchestrator", {"trace": error_trace})
+
+        all_results.append(state)
+        persist_supplier_result(rfp_run_id, state)
+
+        if state.get("status") == "evaluated":
+            any_evaluated = True
 
         if on_progress:
-            on_progress(i + 1, total, result.get("supplier_name", "Unknown"), result.get("status", "failed"))
+            on_progress(i + 1, total, supplier_name, state.get("status", "failed"))
 
-    evaluated = [r for r in all_results if r["status"] == "evaluated"]
+    evaluated = [r for r in all_results if r.get("status") == "evaluated"]
     benchmarks = calculate_benchmarks(evaluated)
     ranked = calculate_ppi_and_rank(evaluated, benchmarks)
     persist_final_ranks(rfp_run_id, ranked)
 
-    update_rfp_run_status(rfp_run_id, "completed")
+    if any_evaluated:
+        update_rfp_run_status(rfp_run_id, "completed")
+    else:
+        update_rfp_run_status(rfp_run_id, "failed",
+                               error_message="No suppliers were successfully evaluated -- check each supplier's trace log.")
+
     return all_results
